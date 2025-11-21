@@ -1,3 +1,4 @@
+# Virtual environments
 audio_env/
 audio_env_3.11/
 env/
@@ -5,9 +6,25 @@ env/
 face_env/
 text_env/
 
+# ML model checkpoints
+wav2vec2_checkpoints/
+pretrained_models/
+
+# Large datasets or artifacts
+*.h5
+*.hdf5
+*.bin
+*.pt
+*.wav
+*.pkl
+*.dylib
+
+# Node/react (if present)
 node_modules/
 build/
 dist/
+
+# Misc
 .DS_Store
 __pycache__/
 
