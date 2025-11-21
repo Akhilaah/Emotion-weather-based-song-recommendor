@@ -1,0 +1,13 @@
+audio_env/
+audio_env_3.11/
+env/
+.venv/
+face_env/
+text_env/
+
+node_modules/
+build/
+dist/
+.DS_Store
+__pycache__/
+
