@@ -12,6 +12,74 @@ import torch
 import torchaudio #type: ignore
 import requests
 import librosa #type: ignore
+import io
+import base64
+import tensorflow as tf
+import tensorflow_hub as hub #type: ignore
+import numpy as np
+import joblib
+
+text_model = joblib.load("text_emotion_model.pkl")
+
+print("Loading YAMNet model...")
+yamnet_model = hub.load("https://tfhub.dev/google/yamnet/1")
+
+
+# Load official class names
+class_map_path = tf.keras.utils.get_file(
+    "yamnet_class_map.csv",
+    "https://raw.githubusercontent.com/tensorflow/models/master/research/audioset/yamnet/yamnet_class_map.csv"
+)
+import csv
+class_names = []
+with open(class_map_path, 'r') as f:
+    reader = csv.reader(f)
+    next(reader)  # skip header
+    for row in reader:
+        class_names.append(row[2])   # <-- THIS is the correct column
+# Map YAMNet classes → emotions
+YAMNET_TO_EMOTION = {
+    "laugh": "happy",
+    "giggle": "happy",
+    "cry": "sad",
+    "sob": "sad",
+    "whimper": "sad",
+    "angry": "angry",
+    "argument": "angry",
+    "scream": "fear",
+    "shout": "fear",
+    "speech": "neutral",
+    "conversation": "neutral"
+}
+def classify_emotion_from_yamnet(wav_path):
+    # Load WAV file
+   # Load WAV with TensorFlow only (no tfio)
+    audio_binary = tf.io.read_file(wav_path)
+    waveform, sr = tf.audio.decode_wav(audio_binary, desired_channels=1)
+    waveform = tf.squeeze(waveform, axis=-1)
+
+
+    # Run YAMNet
+    scores, embeddings, spectrogram = yamnet_model(waveform)
+    mean_scores = tf.reduce_mean(scores, axis=0)
+    top_class = int(tf.argmax(mean_scores))
+    predicted_class = class_names[top_class]
+
+    # Map YAMNet label → emotion
+    emotion = "neutral"
+    for key in YAMNET_TO_EMOTION:
+        if key.lower() in predicted_class.lower():
+            emotion = YAMNET_TO_EMOTION[key]
+            break
+
+    return {
+        "yamnet_class": predicted_class,
+        "emotion": emotion
+    }
+
+
+
+
 
 # ---------------- Environment & Thread Settings ----------------
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -62,11 +130,14 @@ weather_to_genre = {
     "Clouds": "indie",
     "Rain": "acoustic",
     "Thunderstorm": "rock",
+    "Haze": "Ambient",
     "Drizzle": "chill",
     "Snow": "piano",
     "Mist": "ambient",
     "Fog": "lo-fi"
 }
+
+
 
 # ---------------- Face Detector ----------------
 face_classifier = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
@@ -78,13 +149,6 @@ class TextInput(BaseModel):
 class WeatherInput(BaseModel):
     weather: str
     emotion: str
-
-# ---------------- Load SpeechBrain model ----------------
-
-
-
-
-
 
 # ---------------- WEATHER ENDPOINT ----------------
 OPENWEATHER_API_KEY = "ceac93a247353ad23cf698fe6c29531d"
@@ -117,169 +181,102 @@ def get_weather(city: str = Query(..., description="City name")):
         "playlist_url": playlist_url
     }
 
-# ---------------- TEXT EMOTION ENDPOINT ----------------
+# -------- LOAD TRAINED TEXT MODEL --------
+
+
+text_model = joblib.load("text_emotion_model.pkl")
+text_vectorizer = joblib.load("text_vectorizer.pkl")
+
 @app.post("/predict/text")
 async def predict_text(input: TextInput):
-    text = input.text.lower()
-    emotion_keywords = {
-        "happy": ["happy", "joyful", "cheerful", "delighted", "content", "glad", "pleased","great","excited"],
-        "sad": ["sad", "unhappy", "depressed", "miserable", "down", "gloomy", "heartbroken", "melancholy"],
-        "angry": ["angry", "mad", "furious", "irritated", "annoyed", "upset", "enraged"],
-        "fear": ["fear", "afraid", "scared", "terrified", "nervous", "anxious", "worried"],
-        "disgust": ["disgust", "disgusted", "revolted", "repulsed", "nauseated"],
-        "surprise": ["surprise", "amazed", "astonished", "startled", "shocked"],
-        "neutral": ["neutral", "fine", "okay", "normal", "nothing special"]
-    }
-
-    detected_emotion = "neutral"
-    for emotion, keywords in emotion_keywords.items():
-        if any(word in text for word in keywords):
-            detected_emotion = emotion
-            break
-
-    genre = emotion_to_genre.get(detected_emotion, "pop")
-
     try:
+        text = input.text
+
+        # Transform text using the SAME vectorizer used during training
+        x_vec = text_vectorizer.transform([text])
+
+        # Predict the label
+        prediction = text_model.predict(x_vec)[0]
+
+        # Convert label → genre
+        genre = emotion_to_genre.get(prediction.lower(), "chill")
+
+        # Generate playlist
         results = sp.search(q=f"{genre} playlist", type="playlist", limit=5)
         playlist_url = get_playlist_url(results) or "No playlist found"
-    except Exception as e:
-        print("Spotify error:", e)
-        playlist_url = "Error fetching playlist"
-
-    return {"emotion": detected_emotion.capitalize(), "playlist_url": playlist_url}
-
-# ---------------- IMAGE EMOTION ENDPOINT ----------------
-@app.post("/predict/image")
-async def predict_image(file: UploadFile = File(...)):
-    from tensorflow.keras.models import load_model #type: ignore
-    from tensorflow.keras.preprocessing.image import img_to_array #type: ignore
-
-    model = load_model("emotion_model_fixed.h5")
-    emotion_labels = ['Angry', 'Disgust', 'Fear', 'Happy', 'Sad', 'Surprise', 'Neutral']
-
-    contents = await file.read()
-    nparr = np.frombuffer(contents, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    faces = face_classifier.detectMultiScale(gray, 1.3, 5)
-
-    if len(faces) > 0:
-        x, y, w, h = faces[0]
-        roi_gray = gray[y:y+h, x:x+w]
-        roi_gray = cv2.resize(roi_gray, (48, 48))
-        roi = roi_gray.astype('float') / 255.0
-        roi = img_to_array(roi)
-        roi = np.expand_dims(roi, axis=0)
-        prediction = model.predict(roi, verbose=0)[0]
-        emotion = emotion_labels[prediction.argmax()]
-    else:
-        emotion = "Neutral"
-
-    genre = emotion_to_genre.get(emotion.lower(), "pop")
-    try:
-        results = sp.search(q=f"{genre} playlist", type="playlist", limit=5)
-        playlist_url = get_playlist_url(results) or "No playlist found"
-    except Exception as e:
-        print("Spotify error:", e)
-        playlist_url = "Error fetching playlist"
-
-    return {"emotion": emotion, "playlist_url": playlist_url}
-
-
-"""# ---------------- AUDIO EMOTION ENDPOINT ----------------
-from pyAudioAnalysis import audioTrainTest as aT  # type: ignore
-from pydub import AudioSegment  # type: ignore
-
-@app.post("/predict/audio")
-async def predict_audio(audio: UploadFile = File(...)):
-    try:
-        # Save uploaded audio
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as temp_audio:
-            temp_audio.write(await audio.read())
-            webm_path = temp_audio.name
-
-        # Convert to WAV
-        wav_path = webm_path.replace(".webm", ".wav")
-        AudioSegment.from_file(webm_path).export(wav_path, format="wav")
-
-        # Load emotion model (correct 4-class model)
-    
-        model_path = "/Users/akhilaa/mood_song_recommender/face_env/lib/python3.12/site-packages/pyAudioAnalysis/models/svm_rbf_4class"
-        loaded = aT.load_model(model_path)
-
-        classifier = loaded[0]
-        mean = loaded[1]
-        std = loaded[2]
-        labels = loaded[3]
-
-        # Predict emotion
-        result, probabilities = aT.file_classification(wav_path, model_path, "svm")
-        predicted_emotion = labels[int(result)]
-
-        # Map emotion → playlist genre
-        emotion_map = {
-            "happiness": "pop",
-            "anger": "metal",
-            "sadness": "lofi",
-            "fear": "ambient"
-        }
-
-        genre = emotion_map.get(predicted_emotion.lower(), "pop")
-
-        # Spotify playlist search
-        results = sp.search(q=f"{genre} playlist", type="playlist", limit=5)
-        playlist_url = get_playlist_url(results)
-
-        os.remove(webm_path)
-        os.remove(wav_path)
 
         return {
-            "emotion": predicted_emotion,
-            "recommended_genre": genre,
+            "emotion": prediction,
+            "genre": genre,
             "playlist_url": playlist_url
         }
 
     except Exception as e:
-        return {"error": f"Audio processing error: {str(e)}"}
-        """
-"""# ---------------- AUDIO EMOTION ENDPOINT ----------------
-from pyAudioAnalysis import audioTrainTest as aT
-from pydub import AudioSegment
+        return {"error": f"text prediction failed: {str(e)}"}
 
-@app.post("/predict/audio")
-async def predict_audio(audio: UploadFile = File(...)):
+# ---------------- IMAGE EMOTION ENDPOINT ----------------
+@app.post("/predict/image")
+async def predict_image(file: UploadFile = File(...)):
+    from deepface import DeepFace
+    import numpy as np
+    import cv2
+
     try:
-        # Save uploaded audio
+        # Read uploaded image
+        contents = await file.read()
+        nparr = np.frombuffer(contents, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        # DeepFace emotion analysis
+        result = DeepFace.analyze(img, actions=['emotion'], enforce_detection=False)
+
+        emotion = result[0]["dominant_emotion"].capitalize()
+
+        # Map emotion → genre
+        genre = emotion_to_genre.get(emotion.lower(), "pop")
+
+        # Spotify playlist
+        results = sp.search(q=f"{genre} playlist", type="playlist", limit=5)
+        playlist_url = get_playlist_url(results)
+
+        return {
+            "emotion": emotion,
+            "playlist_url": playlist_url
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+    return {"emotion": emotion, "playlist_url": playlist_url}
+       
+@app.post("/analyze-audio")
+async def analyze_audio(audio: UploadFile = File(...)):
+    try:
+        # Save incoming .webm file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as temp_audio:
             temp_audio.write(await audio.read())
             webm_path = temp_audio.name
 
-        # Convert WEBM → WAV
+        # Convert WEBM → WAV for librosa/YAMNet
         wav_path = webm_path.replace(".webm", ".wav")
-        AudioSegment.from_file(webm_path).export(wav_path, format="wav")
+        command = [
+            "ffmpeg", "-i", webm_path,
+            "-ar", "16000", "-ac", "1",
+            wav_path, "-y"
+        ]
+        subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-        # Load 4-class model
-        model_path = "/Users/akhilaa/mood_song_recommender/face_env/lib/python3.12/site-packages/pyAudioAnalysis/models/svm_rbf_4class"
+        # YAMNet classification
+        result = classify_emotion_from_yamnet(wav_path)
+        yam_class = result["yamnet_class"]
+        predicted_emotion = result["emotion"]
 
-        classifier, mean, std = aT.load_model(model_path)
 
-        # ---- GET class names (IMPORTANT FIX) ----
-        class_names = classifier.class_names if hasattr(classifier, "class_names") else classifier.classes_
+        # Map emotion to genre
+        genre = emotion_to_genre.get(predicted_emotion.lower(), "chill")
 
-        # ---- Predict emotion (ONLY TWO VALUES RETURNED) ----
-        result, probabilities = aT.file_classification(wav_path, model_path, "svm")
-        predicted_emotion = class_names[int(result)]
-
-        # Emotion → Genre mapping
-        emotion_map = {
-            "happiness": "pop",
-            "anger": "metal",
-            "sadness": "lofi",
-            "fear": "ambient"
-        }
-        genre = emotion_map.get(predicted_emotion.lower(), "pop")
-
-        # Spotify playlist
+        # Get Spotify playlist
         results = sp.search(q=f"{genre} playlist", type="playlist", limit=5)
         playlist_url = get_playlist_url(results)
 
@@ -288,25 +285,23 @@ async def predict_audio(audio: UploadFile = File(...)):
         os.remove(wav_path)
 
         return {
+            "yamnet_class": yam_class,
             "emotion": predicted_emotion,
-            "recommended_genre": genre,
-            "playlist_url": playlist_url,
-            "debug": {
-                "class_names": class_names,
-                "result": int(result),
-                "probabilities": probabilities.tolist(),
-            }
+            "genre": genre,
+            "playlistUrl": playlist_url
         }
 
     except Exception as e:
-        return {"error": f"Audio processing error: {str(e)}"}
-"""
+        return {"error": f"Audio processing failed: {str(e)}"}
+
+
 
 # ---------------- WEATHER + EMOTION RECOMMENDATION ----------------
 @app.post("/predict/weather")
 async def recommend_by_weather(input: WeatherInput):
     weather = input.weather.lower()
     emotion = input.emotion.lower()
+   
 
     weather_emotion_genres = {
         ("sunny", "happy"): "pop",
@@ -336,6 +331,7 @@ async def auto_weather_emotion(data: dict):
     lat = data["lat"]
     lon = data["lon"]
     emotion = data["emotion"].lower()
+    
 
     # Get weather from OpenWeather
     url = f"http://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=metric"

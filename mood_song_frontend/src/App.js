@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import axios from "axios";
 import "./App.css";
 import ImageInput from "./components/ImageInput";
@@ -14,6 +14,13 @@ function App() {
   const [currentWeather, setCurrentWeather] = useState(null);
   const [currentTemp, setCurrentTemp] = useState(null);
   const [weatherLoading, setWeatherLoading] = useState(true);
+  // 🎙 AUDIO STATES
+  const [recordStatus, setRecordStatus] = useState("idle"); // idle | recording | uploading
+  const [audioEmotion, setAudioEmotion] = useState("");
+  const [audioPlaylistUrl, setAudioPlaylistUrl] = useState("");
+  const mediaRecorderRef = useRef(null);
+  const chunksRef = useRef([]);
+
 
   console.log("User location:", { lat, lon });
 
@@ -108,6 +115,79 @@ function App() {
       alert("Text prediction failed");
     }
   };
+  
+  
+  const startRecording = async () => {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+    const options = { mimeType: "audio/webm; codecs=opus" };
+    const recorder = new MediaRecorder(stream, options);
+
+    mediaRecorderRef.current = recorder;
+    chunksRef.current = [];
+
+    recorder.ondataavailable = (event) => {
+      if (event.data.size > 0) {
+        chunksRef.current.push(event.data);
+      }
+    };
+
+    recorder.onstop = async () => {
+      const blob = new Blob(chunksRef.current, { type: "audio/webm; codecs=opus" });
+      console.log("🎤 Blob size:", blob.size);
+
+      if (blob.size === 0) {
+        alert("Audio capture failed — blob is empty!");
+        setRecordStatus("idle");
+        return;
+      }
+
+      await uploadAudio(blob);
+    };
+
+    recorder.start(200); // <-- IMPORTANT
+    console.log("🎙️ Recording started...");
+    setRecordStatus("recording");
+
+  } catch (err) {
+    console.error(err);
+    alert("Please allow microphone access.");
+  }
+};
+
+
+const stopRecording = () => {
+  if (mediaRecorderRef.current) {
+    console.log("🛑 Recording stopped...");
+    mediaRecorderRef.current.stop();
+    setRecordStatus("uploading");
+  }
+};
+
+
+const uploadAudio = async (blob) => {
+  try {
+    const formData = new FormData();
+    formData.append("audio", blob, "recording.webm");
+
+    console.log("⬆️ Uploading blob size:", blob.size);
+
+    const res = await axios.post("http://127.0.0.1:8000/analyze-audio", formData, {
+      headers: { "Content-Type": "multipart/form-data" },
+    });
+
+    console.log("📥 Backend Response:", res.data);
+
+    setAudioEmotion(res.data.emotion);
+    setAudioPlaylistUrl(res.data.playlistUrl);
+    setRecordStatus("idle");
+
+  } catch (err) {
+    console.error("Audio upload error:", err);
+    setRecordStatus("idle");
+  }
+};
 
   // ---------------- IMAGE UPLOAD EMOTION ----------------
   const handleImageSubmit = async () => {
@@ -184,6 +264,56 @@ function App() {
         <h2>Real-Time Camera Emotion</h2>
         <ImageInput onResult={handleImageResult} />
       </div>
+
+      
+      {/* AUDIO EMOTION */}
+<div className="card">
+  <h2>🎙 Audio Emotion</h2>
+
+  {recordStatus === "idle" && (
+    <button onClick={startRecording}>
+      🎤 Start Recording
+    </button>
+  )}
+
+  {recordStatus === "recording" && (
+    <button onClick={stopRecording} style={{ background: "red" }}>
+      ⏹ Stop Recording
+    </button>
+  )}
+
+  {recordStatus === "uploading" && <p>Analyzing your audio...</p>}
+
+  {audioEmotion && (
+    <p>
+      <strong>Emotion:</strong> {audioEmotion}
+    </p>
+  )}
+
+  {audioPlaylistUrl && (
+    <a
+      href={audioPlaylistUrl}
+      target="_blank"
+      rel="noreferrer"
+      className="lavender-button"
+      style={{
+        display: "inline-block",
+        marginTop: "10px",
+        padding: "12px 25px",
+        borderRadius: "30px",
+        background: "linear-gradient(90deg, #84fab0, #8fd3f4)",
+        color: "white",
+        textDecoration: "none",
+        fontWeight: "500"
+      }}
+    >
+      🎧 Open Audio-Based Playlist
+    </a>
+  )}
+</div>
+
+
+
 
       {/* IMAGE UPLOAD */}
       <div className="card">
